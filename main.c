@@ -2,101 +2,242 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <netinet/in.h>
 #include <string.h>
 #include <netdb.h>
 #include <arpa/inet.h> 
+#include <unistd.h>
+#include <assert.h>
+#include <pthread.h>
+#include <errno.h>
 
-#define MAXBUFLEN 100
+#define MAXBUFLEN 1024
+#define NUM_THREADS 4
 
-void inputFromKeyboard(List* sharedListOUT, char* buffer)
+pthread_mutex_t mutex1 = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t mutex2 = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t  cv1 = PTHREAD_COND_INITIALIZER;
+pthread_cond_t  cv2 = PTHREAD_COND_INITIALIZER;
+pthread_cond_t  cv3 = PTHREAD_COND_INITIALIZER;
+pthread_cond_t  cv4 = PTHREAD_COND_INITIALIZER;
+
+struct arg_struct {
+    struct addrinfo* remote;
+    List* list;
+    int socket;
+};
+
+void inputFromKeyboard(List* sharedListOUT)
 {
-    while(read(0, (void*) buffer, sizeof(buffer)) > 0)
+    while(1)
     {
-      List_add(sharedListOUT, buffer);
+        int nread;
+        char* line;
+        char buffer[MAXBUFLEN];
+        if((nread = read(STDIN_FILENO, (void*) buffer, MAXBUFLEN)) > 0)
+        {   printf("I just read from keyboard returns: %d\n",nread);
+            buffer[nread-1] = '\0';
+            printf("%s BUFFER\n",buffer);
+            line = malloc(nread + 1);
+            memcpy(line, buffer, nread + 1);
+
+            pthread_mutex_lock(&mutex1);
+            List_last(sharedListOUT); 
+            int returnVal = List_add(sharedListOUT, line);
+            if(returnVal == -1) 
+            {
+                pthread_cond_wait(&cv1, &mutex1); 
+                List_add(sharedListOUT, line);
+            }
+            pthread_cond_signal(&cv2);
+            pthread_mutex_unlock(&mutex1);
+        }
     }
 }
 
-void inBound()
+void outBound(void* arguments)
 {
-  //  recvfrom(s, &msg, len, 0, (struct sockaddr *)&remote, sizeof(struct sockaddr_in));
+    int s = ((struct arg_struct*)arguments)->socket;
+    List* sharedListOUT = ((struct arg_struct*)arguments)->list;
+    struct addrinfo* remote = ((struct arg_struct*)arguments)->remote;
+
+    while(1)
+    {
+        pthread_mutex_lock(&mutex1);
+        if(List_count(sharedListOUT) == 0)
+        {
+            pthread_cond_wait(&cv2, &mutex1);
+        }
+        void* toBeFreed = List_first(sharedListOUT);
+        List_remove(sharedListOUT);
+        pthread_cond_signal(&cv1);
+        pthread_mutex_unlock(&mutex1);
+
+        //printf("%s %d\n",(char*)toBeFreed,strlen( (char*)toBeFreed) );
+        ssize_t nsend = sendto(s, toBeFreed, strlen( (char*)toBeFreed), 0, (struct sockaddr *)remote->ai_addr, remote->ai_addrlen);
+        printf("I just send to otherside returns: %d\n",nsend);
+        free(toBeFreed);
+    }
 }
 
-void printCharacters()
+void inBound(void* arguments)
 {
-    
+    int s = ((struct arg_struct*)arguments)->socket;
+    List* sharedListIN = ((struct arg_struct*)arguments)->list;
+    struct addrinfo* remote = ((struct arg_struct*)arguments)->remote;
+
+    while(1)
+    { 
+        ssize_t nread;
+        char* line;
+        char buffer[MAXBUFLEN];
+        
+        printf("HOP%d\n",recvfrom(s, buffer, MAXBUFLEN, 0, (struct sockaddr *)(remote->ai_addr), remote->ai_addrlen));
+        printf("recvfrom() failed %s\n", strerror(errno));
+        if( (nread = recvfrom(s, (void*)&buffer, MAXBUFLEN, 0, (struct sockaddr *)(remote->ai_addr), remote->ai_addrlen)) > 0)
+        {   printf("I just read from otherside returns: %d\n",nread);
+            buffer[nread] = '\0';
+            line = malloc(nread + 1);
+            memcpy(line, buffer, nread + 1);
+
+            pthread_mutex_lock(&mutex2);
+            List_last(sharedListIN); 
+            int returnVal = List_add(sharedListIN, line);
+            if(returnVal == -1) 
+            {
+                pthread_cond_wait(&cv3, &mutex2); 
+                List_add(sharedListIN, line);
+            }
+            pthread_cond_signal(&cv4);
+            pthread_mutex_unlock(&mutex2);
+        }
+    }
 }
 
-void outBound()
+void printCharacters(List* sharedListIN)
 {
-//    sendto(s, &msg, len, 0, (struct sockaddr *)&remote, sizeof(struct sockaddr_in));  
+    while(1)
+    {
+        pthread_mutex_lock(&mutex2);
+        if(List_count(sharedListIN) == 0)
+        {
+            pthread_cond_wait(&cv4, &mutex2);
+        }
+        void* toBeFreed = List_first(sharedListIN);
+        List_remove(sharedListIN);
+        pthread_cond_signal(&cv3);
+        pthread_mutex_unlock(&mutex2);
+
+        //printf("%s %d\n",(char*)toBeFreed,strlen( (char*)toBeFreed) );
+        int nwrite = write(STDOUT_FILENO, toBeFreed, strlen( (char*)toBeFreed) - 1);
+        printf("I just wrote to screen returns: %d\n",nwrite);
+        free(toBeFreed);
+    }
 }
+/////////
+
 
 int main(int argc, char **argv)
 {  
     if(argc <3)
-      return -1;
+        return -1;
 
-    char bufferIN[MAXBUFLEN];
-    char bufferOUT[MAXBUFLEN];
+    pthread_t threads[NUM_THREADS];
+    int result_code;
     List* sharedListIN = List_create();
     List* sharedListOUT = List_create();
-
     char* inport = argv[1]; // in port
     char* service = argv[3]; // out port
     char* hostname = argv[2]; // name
+    int s;
+    unsigned short int port;
+    struct sockaddr_in addr;
+    struct addrinfo hints,*remote_res;
+    int status;
 
-    printf("%s %s %s\n",argv[1],argv[2],argv[3]);
+    //printf("%s %s %s\n",argv[1],argv[2],argv[3]);
 
-    unsigned short int port = atoi(inport);
-    struct sockaddr_in addr;  
-
-    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    port = atoi(inport); 
+    s = socket(AF_INET, SOCK_DGRAM, 0);
 
     addr.sin_family = AF_INET;  
     addr.sin_port = htons(port);  
     addr.sin_addr.s_addr = INADDR_ANY;  
     memset(&addr.sin_zero, 0,8);
-    
-    bind(s, (struct sockaddr *)&addr, sizeof(struct sockaddr_in));
-    printf("%s\n",inet_ntoa(addr.sin_addr));
 
-    struct addrinfo hints,*remote_res;
+    bind(s, (struct sockaddr *)&addr, sizeof(struct sockaddr_in));
+    //printf("%s\n",inet_ntoa(addr.sin_addr));
+
     memset(&hints, 0, sizeof(hints) );
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_DGRAM;
     hints.ai_protocol = IPPROTO_UDP;
-    int status;
     status = getaddrinfo(hostname, service, &hints, &remote_res);
-    printf("Status : %d",status);
-////////////////////////////////////////////////
+    printf("Status : %d\n",status);
+
+    struct arg_struct argumentsOutBound;
+    argumentsOutBound.list = sharedListOUT;
+    argumentsOutBound.socket = s;
+    argumentsOutBound.remote = remote_res;
+
+    struct arg_struct argumentsInBound;
+    argumentsInBound.list = sharedListIN;
+    argumentsInBound.socket = s;
+    argumentsInBound.remote = remote_res;
+
+    //Creating the threads
+    result_code = pthread_create(&threads[0], NULL, inputFromKeyboard, sharedListOUT);
+    assert(!result_code);
+
+    result_code = pthread_create(&threads[1], NULL, outBound, &argumentsOutBound);
+    assert(!result_code);
+
+    result_code = pthread_create(&threads[2], NULL, inBound, &argumentsInBound);
+    assert(!result_code);
+
+    result_code = pthread_create(&threads[3], NULL, printCharacters, sharedListIN);
+    assert(!result_code);
+
+    while(1)
+    {
+        char buffer[1000];
+        recvfrom(s, buffer, sizeof(buffer), 0, (struct sockaddr *)(remote_res->ai_addr), remote_res->ai_addrlen);
+        printf("buffer %s size : %d\n",buffer,sizeof(buffer));
+    }
+    //wait for each thread to complete
+    for (int i = 0; i < 1; i++) 
+    {
+        result_code = pthread_join(threads[i], NULL);
+        assert(!result_code);
+    }
+    freeaddrinfo(remote_res);  
+    return -1;
+}
+
+/*
     char ipstr[INET6_ADDRSTRLEN];
     struct addrinfo *p;
     for(p = remote_res;p != NULL; p = p->ai_next) {
         void *addr;
         char *ipver;
 
-        // get the pointer to the address itself,
-        // different fields in IPv4 and IPv6:
-        if (p->ai_family == AF_INET) { // IPv4
+        if (p->ai_family == AF_INET) { 
             struct sockaddr_in *ipv4 = (struct sockaddr_in *)p->ai_addr;
             addr = &(ipv4->sin_addr);
             ipver = "IPv4";
-        } else { // IPv6
+        } else { 
             struct sockaddr_in6 *ipv6 = (struct sockaddr_in6 *)p->ai_addr;
             addr = &(ipv6->sin6_addr);
             ipver = "IPv6";
         }
 
-        // convert the IP to a string and print it:
         inet_ntop(p->ai_family, addr, ipstr, sizeof ipstr);
         printf("  %s: %s\n", ipver, ipstr);
     }
-/////////////////////////////////////////////////
-    char msg1[MAXBUFLEN] = "KARDESIN";
-    char msg2[MAXBUFLEN];
+*/
 
-    while(true)
+ /*   while(true)
     {   //printf("DUDE\n");
         sendto(s, (void*)&msg1, sizeof(msg1), 0, (struct sockaddr *)remote_res->ai_addr, remote_res->ai_addrlen);
         //printf("DUD1E");
@@ -105,6 +246,4 @@ int main(int argc, char **argv)
         printf("%s\n",(char*)msg2);
 
     }
-
-    return -1;
-}
+*/
