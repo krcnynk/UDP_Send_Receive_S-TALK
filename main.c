@@ -12,7 +12,7 @@
 #include <pthread.h>
 #include <errno.h>
 
-#define MAXBUFLEN 1024
+#define MAXBUFLEN 512
 #define NUM_THREADS 4
 
 pthread_mutex_t mutex1 = PTHREAD_MUTEX_INITIALIZER;
@@ -35,13 +35,14 @@ void inputFromKeyboard(List* sharedListOUT)
         int nread;
         char* line;
         char buffer[MAXBUFLEN];
-        if((nread = read(STDIN_FILENO, (void*) buffer, MAXBUFLEN)) > 0)
-        {   printf("I just read from keyboard returns: %d\n",nread);
-            buffer[nread-1] = '\0';
-            printf("%s BUFFER\n",buffer);
-            line = malloc(nread + 1);
-            memcpy(line, buffer, nread + 1);
 
+        if((nread = read(STDIN_FILENO, buffer, sizeof(buffer))) > 0)
+        {   printf("I just read (nread)from keyboard returns: %d %d\n",nread);
+            buffer[nread-1] = '\0';
+            //printf("%s BUFFER\n",buffer);
+            line = malloc(nread);
+            memcpy(line, buffer, nread);
+            //printf("%s line\n",line);
             pthread_mutex_lock(&mutex1);
             List_last(sharedListOUT); 
             int returnVal = List_add(sharedListOUT, line);
@@ -61,6 +62,8 @@ void outBound(void* arguments)
     int s = ((struct arg_struct*)arguments)->socket;
     List* sharedListOUT = ((struct arg_struct*)arguments)->list;
     struct addrinfo* remote = ((struct arg_struct*)arguments)->remote;
+    int nsend;
+    void* toBeFreed;
 
     while(1)
     {
@@ -69,14 +72,18 @@ void outBound(void* arguments)
         {
             pthread_cond_wait(&cv2, &mutex1);
         }
-        void* toBeFreed = List_first(sharedListOUT);
+        toBeFreed = List_first(sharedListOUT);
         List_remove(sharedListOUT);
         pthread_cond_signal(&cv1);
         pthread_mutex_unlock(&mutex1);
 
-        //printf("%s %d\n",(char*)toBeFreed,strlen( (char*)toBeFreed) );
-        ssize_t nsend = sendto(s, toBeFreed, strlen( (char*)toBeFreed), 0, (struct sockaddr *)remote->ai_addr, remote->ai_addrlen);
-        printf("I just send to otherside returns: %d\n",nsend);
+        int remainder = 0;
+        while(remainder < strlen( (char*)toBeFreed))
+        {
+            nsend = sendto(s, toBeFreed, strlen( (char*)toBeFreed), 0, (struct sockaddr *)remote->ai_addr, remote->ai_addrlen);
+            remainder += nsend;
+        }
+        printf("I just send (nsend) to otherside returns: %d\n",nsend);
         free(toBeFreed);
     }
 }
@@ -89,13 +96,13 @@ void inBound(void* arguments)
 
     while(1)
     { 
-        ssize_t nread;
+        int nread;
         char* line;
         char buffer[MAXBUFLEN];
         
-        printf("HOP%d\n",recvfrom(s, buffer, MAXBUFLEN, 0, (struct sockaddr *)(remote->ai_addr), remote->ai_addrlen));
-        printf("recvfrom() failed %s\n", strerror(errno));
-        if( (nread = recvfrom(s, (void*)&buffer, MAXBUFLEN, 0, (struct sockaddr *)(remote->ai_addr), remote->ai_addrlen)) > 0)
+        //printf("HOP%d\n",recvfrom(s, buffer, MAXBUFLEN, 0, (struct sockaddr *)(remote->ai_addr), remote->ai_addrlen));
+        //printf("recvfrom() failed %s\n", strerror(errno));
+        if( (nread = recvfrom(s, buffer, sizeof(buffer), 0, (struct sockaddr *)(remote->ai_addr), remote->ai_addrlen)) > 0)
         {   printf("I just read from otherside returns: %d\n",nread);
             buffer[nread] = '\0';
             line = malloc(nread + 1);
@@ -130,12 +137,11 @@ void printCharacters(List* sharedListIN)
         pthread_mutex_unlock(&mutex2);
 
         //printf("%s %d\n",(char*)toBeFreed,strlen( (char*)toBeFreed) );
-        int nwrite = write(STDOUT_FILENO, toBeFreed, strlen( (char*)toBeFreed) - 1);
+        int nwrite = write(STDOUT_FILENO, toBeFreed, strlen( (char*)toBeFreed));
         printf("I just wrote to screen returns: %d\n",nwrite);
         free(toBeFreed);
     }
 }
-/////////
 
 
 int main(int argc, char **argv)
@@ -199,14 +205,14 @@ int main(int argc, char **argv)
     result_code = pthread_create(&threads[3], NULL, printCharacters, sharedListIN);
     assert(!result_code);
 
-    while(1)
-    {
-        char buffer[1000];
-        recvfrom(s, buffer, sizeof(buffer), 0, (struct sockaddr *)(remote_res->ai_addr), remote_res->ai_addrlen);
-        printf("buffer %s size : %d\n",buffer,sizeof(buffer));
-    }
+    // while(1)
+    // {
+    //     char buffer[1000];
+    //     recvfrom(s, buffer, sizeof(buffer), 0, (struct sockaddr *)(remote_res->ai_addr), remote_res->ai_addrlen);
+    //     printf("buffer %s size : %d\n",buffer,sizeof(buffer));
+    // }
     //wait for each thread to complete
-    for (int i = 0; i < 1; i++) 
+    for (int i = 0; i < NUM_THREADS; i++) 
     {
         result_code = pthread_join(threads[i], NULL);
         assert(!result_code);
