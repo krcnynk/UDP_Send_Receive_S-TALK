@@ -12,7 +12,7 @@
 #include <pthread.h>
 #include <errno.h>
 
-#define MAXBUFLEN 512
+#define MAXBUFLEN 100
 #define NUM_THREADS 4
 
 pthread_mutex_t mutex1 = PTHREAD_MUTEX_INITIALIZER;
@@ -22,6 +22,8 @@ pthread_cond_t  cv2 = PTHREAD_COND_INITIALIZER;
 pthread_cond_t  cv3 = PTHREAD_COND_INITIALIZER;
 pthread_cond_t  cv4 = PTHREAD_COND_INITIALIZER;
 pthread_mutex_t mutexClose = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t  cvClose = PTHREAD_COND_INITIALIZER;
+bool Close = false;
 pthread_t threads[NUM_THREADS];
 
 struct arg_struct {
@@ -30,37 +32,28 @@ struct arg_struct {
     int socket;
 };
 
+int x = 0;
+int y = 0;
 void* inputFromKeyboard(void* arg)
-{
+{   
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+    pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
     List* sharedListOUT = arg;
     while(1)
     {
         int nread;
-        char* line;
         char buffer[MAXBUFLEN];
-
-        if((nread = read(STDIN_FILENO, buffer, sizeof(buffer))) > 0)
+        char* line;
+        if((nread = read(STDIN_FILENO, buffer, sizeof(buffer)-1)) > 0)
         {
-            if(nread == 2 && buffer[0] == '!')
-            {
-                for(int i = 1; i<=NUM_THREADS;i++)
-                {
-                    pthread_cancel(threads[i%4]);
-                }
-            }
-            //printf("I just read (nread)from keyboard returns: %d %d\n",nread);
-            buffer[nread-1] = '\0';
-            //printf("%s BUFFER\n",buffer);
-            line = malloc(nread);
+            line = malloc(nread+1);
+            line[nread] = '\0';
             memcpy(line, buffer, nread);
-            //printf("%s line\n",line);
+            //write(STDOUT_FILENO,line, nread);
             pthread_mutex_lock(&mutex1);
-            List_last(sharedListOUT); 
-            int returnVal = List_add(sharedListOUT, line);
-            if(returnVal == -1) 
+            while(List_prepend(sharedListOUT, (void*) line) == -1) 
             {
-                pthread_cond_wait(&cv1, &mutex1); 
-                List_add(sharedListOUT, line);
+                pthread_cond_wait(&cv1, &mutex1); //Wait if the list is full
             }
             pthread_cond_signal(&cv2);
             pthread_mutex_unlock(&mutex1);
@@ -70,38 +63,44 @@ void* inputFromKeyboard(void* arg)
 
 void* outBound(void* arguments)
 {
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+    pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
     int s = ((struct arg_struct*)arguments)->socket;
     List* sharedListOUT = ((struct arg_struct*)arguments)->list;
     struct addrinfo* remote = ((struct arg_struct*)arguments)->remote;
     int nsend;
-    void* toBeFreed;
-
+    int remainder;
+    char* toBeFreed;
     while(1)
     {
         pthread_mutex_lock(&mutex1);
-        if(List_count(sharedListOUT) == 0)
+        while(List_count(sharedListOUT) < 1)
         {
             pthread_cond_wait(&cv2, &mutex1);
         }
-        toBeFreed = List_first(sharedListOUT);
-        List_remove(sharedListOUT);
-        pthread_cond_signal(&cv1);
+        toBeFreed = List_trim(sharedListOUT);
+        pthread_cond_signal(&cv1); // Removed so signal
         pthread_mutex_unlock(&mutex1);
-
-        //printf("%d , %s",strlen( (char*)toBeFreed),(char*)toBeFreed);
-        int remainder = 0;
-        while(remainder < strlen( (char*)toBeFreed))
+        remainder = 0;
+        while(remainder < strlen(toBeFreed))
         {
-            nsend = sendto(s, toBeFreed, strlen( (char*)toBeFreed), 0, remote->ai_addr, remote->ai_addrlen);
+            nsend = sendto(s, toBeFreed, strlen(toBeFreed), 0, remote->ai_addr, remote->ai_addrlen);
             remainder += nsend;
         }
-        //printf("I just send (nsend) to otherside returns: %d\n",nsend);
+
+        if(strlen(toBeFreed) == 2 && toBeFreed[0] == '!') //CANCEL
+        {
+            for(int i = 0; i<4 ; i++)
+                pthread_cancel(threads[i]);
+        }
         free(toBeFreed);
     }
 }
 
 void* inBound(void* arguments)
 {
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+    pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
     int s = ((struct arg_struct*)arguments)->socket;
     List* sharedListIN = ((struct arg_struct*)arguments)->list;
     struct addrinfo* remote = ((struct arg_struct*)arguments)->remote;
@@ -111,23 +110,16 @@ void* inBound(void* arguments)
         int nread;
         char* line;
         char buffer[MAXBUFLEN];
-        
-        //printf("HOP%d\n",recvfrom(s, buffer, MAXBUFLEN, 0, (struct sockaddr *)(remote->ai_addr), remote->ai_addrlen));
-        //printf("recvfrom() failed %s\n", strerror(errno));
         if( (nread = recvfrom(s, buffer, sizeof(buffer), 0, remote->ai_addr, &remote->ai_addrlen)) > 0)
-        {   //printf("I just read from otherside returns: %d\n",nread);
-            buffer[nread] = '\n';
-            buffer[nread+1] = '\0';
-            line = malloc(nread + 2);
-            memcpy(line, buffer, nread + 2);
+        {
+            line = malloc(nread + 1);
+            line[nread] = '\0';
+            memcpy(line, buffer, nread);
 
             pthread_mutex_lock(&mutex2);
-            List_last(sharedListIN); 
-            int returnVal = List_add(sharedListIN, line);
-            if(returnVal == -1) 
+            while(List_prepend(sharedListIN, line) == -1) 
             {
                 pthread_cond_wait(&cv3, &mutex2); 
-                List_add(sharedListIN, line);
             }
             pthread_cond_signal(&cv4);
             pthread_mutex_unlock(&mutex2);
@@ -137,22 +129,33 @@ void* inBound(void* arguments)
 
 void* printCharacters(void* arg)
 {
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+    pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
     List* sharedListIN = arg;
+    char* toBeFreed;
     while(1)
     {
         pthread_mutex_lock(&mutex2);
-        if(List_count(sharedListIN) == 0)
+        while(List_count(sharedListIN) < 1)
         {
             pthread_cond_wait(&cv4, &mutex2);
         }
-        void* toBeFreed = List_first(sharedListIN);
-        List_remove(sharedListIN);
+        toBeFreed = List_trim(sharedListIN);
         pthread_cond_signal(&cv3);
         pthread_mutex_unlock(&mutex2);
 
-        //printf("%s %d\n",(char*)toBeFreed,strlen( (char*)toBeFreed) );
-        int nwrite = write(STDOUT_FILENO, toBeFreed, strlen( (char*)toBeFreed));
-        //printf("I just wrote to screen returns: %d\n",nwrite);
+        int remaining = 0;
+        while(remaining < strlen( (char*)toBeFreed))
+        {
+            int nwrite = write(STDOUT_FILENO, toBeFreed, strlen( (char*)toBeFreed) );
+            remaining += nwrite;
+        }
+
+        if(strlen( (char*)toBeFreed) == 2 && toBeFreed[0] == '!') //CANCEL
+        {
+            for(int i = 0; i<4 ; i++)
+                pthread_cancel(threads[i]);
+        }
         free(toBeFreed);
     }
 }
@@ -175,8 +178,6 @@ int main(int argc, char **argv)
     struct addrinfo hints,*remote_res;
     int status;
 
-    //printf("%s %s %s\n",argv[1],argv[2],argv[3]);
-
     port = atoi(inport); 
     s = socket(AF_INET, SOCK_DGRAM, 0);
 
@@ -186,7 +187,6 @@ int main(int argc, char **argv)
     memset(&addr.sin_zero, 0,8);
 
     bind(s, (struct sockaddr *)&addr, sizeof(struct sockaddr_in));
-    //printf("%s\n",inet_ntoa(addr.sin_addr));
 
     memset(&hints, 0, sizeof(hints) );
     hints.ai_family = AF_INET;
@@ -208,13 +208,10 @@ int main(int argc, char **argv)
     //Creating the threads
     result_code = pthread_create(&threads[0], NULL, inputFromKeyboard, sharedListOUT);
     assert(!result_code);
-
     result_code = pthread_create(&threads[1], NULL, outBound, &argumentsOutBound);
     assert(!result_code);
-
     result_code = pthread_create(&threads[2], NULL, inBound, &argumentsInBound);
     assert(!result_code);
-
     result_code = pthread_create(&threads[3], NULL, printCharacters, sharedListIN);
     assert(!result_code);
 
@@ -223,40 +220,8 @@ int main(int argc, char **argv)
         result_code = pthread_join(threads[i], NULL);
         assert(!result_code);
     }
-    close(s);
-    freeaddrinfo(remote_res);  
+    printf("HAHA\n");
+    close(s); //close socket
+    freeaddrinfo(remote_res); //free getaddrinfo return
     return -1;
 }
-
-/*
-    char ipstr[INET6_ADDRSTRLEN];
-    struct addrinfo *p;
-    for(p = remote_res;p != NULL; p = p->ai_next) {
-        void *addr;
-        char *ipver;
-
-        if (p->ai_family == AF_INET) { 
-            struct sockaddr_in *ipv4 = (struct sockaddr_in *)p->ai_addr;
-            addr = &(ipv4->sin_addr);
-            ipver = "IPv4";
-        } else { 
-            struct sockaddr_in6 *ipv6 = (struct sockaddr_in6 *)p->ai_addr;
-            addr = &(ipv6->sin6_addr);
-            ipver = "IPv6";
-        }
-
-        inet_ntop(p->ai_family, addr, ipstr, sizeof ipstr);
-        printf("  %s: %s\n", ipver, ipstr);
-    }
-*/
-
- /*   while(true)
-    {   //printf("DUDE\n");
-        sendto(s, (void*)&msg1, sizeof(msg1), 0, (struct sockaddr *)remote_res->ai_addr, remote_res->ai_addrlen);
-        //printf("DUD1E");
-        recvfrom(s, (void*)&msg2, sizeof(msg2), 0, (struct sockaddr *)remote_res->ai_addr, remote_res->ai_addrlen);
-        //printf("DU2DE");
-        printf("%s\n",(char*)msg2);
-
-    }
-*/
