@@ -16,14 +16,10 @@
 #define NUM_THREADS 4
 
 pthread_mutex_t mutex1 = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t mutex2 = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t  cv1 = PTHREAD_COND_INITIALIZER;
 pthread_cond_t  cv2 = PTHREAD_COND_INITIALIZER;
 pthread_cond_t  cv3 = PTHREAD_COND_INITIALIZER;
 pthread_cond_t  cv4 = PTHREAD_COND_INITIALIZER;
-pthread_mutex_t mutexClose = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t  cvClose = PTHREAD_COND_INITIALIZER;
-bool Close = false;
 pthread_t threads[NUM_THREADS];
 
 struct arg_struct {
@@ -32,13 +28,19 @@ struct arg_struct {
     int socket;
 };
 
-int x = 0;
-int y = 0;
+void cleanup_after(void* allocated_memory)
+{
+    if (allocated_memory)
+        free(allocated_memory);
+    pthread_mutex_unlock(&mutex1);
+}
+
 void* inputFromKeyboard(void* arg)
 {   
     pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
     pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
     List* sharedListOUT = arg;
+    
     while(1)
     {
         int nread;
@@ -49,11 +51,12 @@ void* inputFromKeyboard(void* arg)
             line = malloc(nread+1);
             line[nread] = '\0';
             memcpy(line, buffer, nread);
-            //write(STDOUT_FILENO,line, nread);
             pthread_mutex_lock(&mutex1);
             while(List_prepend(sharedListOUT, (void*) line) == -1) 
             {
+                pthread_cleanup_push(&cleanup_after, line);
                 pthread_cond_wait(&cv1, &mutex1); //Wait if the list is full
+                pthread_cleanup_pop(0);
             }
             pthread_cond_signal(&cv2);
             pthread_mutex_unlock(&mutex1);
@@ -71,29 +74,40 @@ void* outBound(void* arguments)
     int nsend;
     int remainder;
     char* toBeFreed;
+    int len;
+    char exclamation;
+
     while(1)
-    {
+    {   
         pthread_mutex_lock(&mutex1);
         while(List_count(sharedListOUT) < 1)
-        {
+        {   
+            pthread_cleanup_push(&cleanup_after, NULL);
             pthread_cond_wait(&cv2, &mutex1);
+            pthread_cleanup_pop(0);
         }
         toBeFreed = List_trim(sharedListOUT);
+        len = strlen(toBeFreed);
+        exclamation = toBeFreed[0];
         pthread_cond_signal(&cv1); // Removed so signal
         pthread_mutex_unlock(&mutex1);
+
         remainder = 0;
-        while(remainder < strlen(toBeFreed))
+        while(remainder < len)
         {
-            nsend = sendto(s, toBeFreed, strlen(toBeFreed), 0, remote->ai_addr, remote->ai_addrlen);
+            nsend = sendto(s, toBeFreed, len, 0, remote->ai_addr, remote->ai_addrlen);
             remainder += nsend;
         }
 
-        if(strlen(toBeFreed) == 2 && toBeFreed[0] == '!') //CANCEL
-        {
-            for(int i = 0; i<4 ; i++)
-                pthread_cancel(threads[i]);
-        }
         free(toBeFreed);
+
+        if(len == 2 && exclamation == '!') //CANCEL
+        {
+            for(int i = 0; i<NUM_THREADS ; i++)
+            {
+                pthread_cancel(threads[(i+2)%4]);
+            }
+        }
     }
 }
 
@@ -106,7 +120,7 @@ void* inBound(void* arguments)
     struct addrinfo* remote = ((struct arg_struct*)arguments)->remote;
 
     while(1)
-    { 
+    {
         int nread;
         char* line;
         char buffer[MAXBUFLEN];
@@ -116,13 +130,15 @@ void* inBound(void* arguments)
             line[nread] = '\0';
             memcpy(line, buffer, nread);
 
-            pthread_mutex_lock(&mutex2);
-            while(List_prepend(sharedListIN, line) == -1) 
-            {
-                pthread_cond_wait(&cv3, &mutex2); 
+            pthread_mutex_lock(&mutex1);
+            while(List_prepend(sharedListIN, line) == -1) // FULL
+            {   
+                pthread_cleanup_push(&cleanup_after, line);
+                pthread_cond_wait(&cv3, &mutex1); 
+                pthread_cleanup_pop(0);
             }
             pthread_cond_signal(&cv4);
-            pthread_mutex_unlock(&mutex2);
+            pthread_mutex_unlock(&mutex1);
         }
     }
 }
@@ -131,32 +147,42 @@ void* printCharacters(void* arg)
 {
     pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
     pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
+
     List* sharedListIN = arg;
     char* toBeFreed;
+    int len;
+    char exclamation;
     while(1)
     {
-        pthread_mutex_lock(&mutex2);
+        pthread_mutex_lock(&mutex1);
         while(List_count(sharedListIN) < 1)
         {
-            pthread_cond_wait(&cv4, &mutex2);
+            pthread_cleanup_push(&cleanup_after, NULL);
+            pthread_cond_wait(&cv4, &mutex1);
+            pthread_cleanup_pop(0);
         }
         toBeFreed = List_trim(sharedListIN);
+        len = strlen( (char*)toBeFreed);
+        exclamation = toBeFreed[0];
         pthread_cond_signal(&cv3);
-        pthread_mutex_unlock(&mutex2);
+        pthread_mutex_unlock(&mutex1);
 
         int remaining = 0;
         while(remaining < strlen( (char*)toBeFreed))
         {
-            int nwrite = write(STDOUT_FILENO, toBeFreed, strlen( (char*)toBeFreed) );
+            int nwrite = write(STDOUT_FILENO, toBeFreed, len);
             remaining += nwrite;
         }
 
-        if(strlen( (char*)toBeFreed) == 2 && toBeFreed[0] == '!') //CANCEL
-        {
-            for(int i = 0; i<4 ; i++)
-                pthread_cancel(threads[i]);
-        }
         free(toBeFreed);
+
+        if(len == 2 && exclamation == '!') //CANCEL
+        {
+            for(int i = 0; i < 4 ; i++)
+            {
+                pthread_cancel(threads[i]);
+            }
+        }
     }
 }
 
@@ -220,7 +246,8 @@ int main(int argc, char **argv)
         result_code = pthread_join(threads[i], NULL);
         assert(!result_code);
     }
-    printf("HAHA\n");
+
+    printf("Closing\n");
     close(s); //close socket
     freeaddrinfo(remote_res); //free getaddrinfo return
     return -1;
