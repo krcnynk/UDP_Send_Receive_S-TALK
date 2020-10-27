@@ -219,7 +219,6 @@ int main(int argc, char **argv)
     hints.ai_socktype = SOCK_DGRAM;
     hints.ai_protocol = IPPROTO_UDP;
     status = getaddrinfo(hostname, service, &hints, &remote_res);
-    printf("Status : %d\n",status);
 
     struct arg_struct argumentsOutBound;
     argumentsOutBound.list = sharedListOUT;
@@ -247,7 +246,6 @@ int main(int argc, char **argv)
         assert(!result_code);
     }
 
-    printf("Closing\n");
     close(s); //close socket
     freeaddrinfo(remote_res); //free getaddrinfo return
     return -1;
